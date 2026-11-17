@@ -1,5 +1,7 @@
 """HTTP + WebSocket endpoints, with the Groq-backed services replaced by fakes."""
 
+import asyncio
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -18,8 +20,10 @@ class FakeTranscription:
     def __init__(self):
         self.calls = 0
         self.languages = []
+        self.delay_s = 0.0  # simulated Groq round trip
 
     async def transcribe(self, wav, context="", language=None, optional=False):
+        await asyncio.sleep(self.delay_s)
         self.calls += 1
         self.languages.append(language)
         return TranscriptionResult(text=f"utterance {self.calls}", language=language, audio_ms=1000, upstream_ms=3)
@@ -140,6 +144,32 @@ def test_websocket_start_selects_the_language(client):
 
 def test_websocket_auto_language_means_detect(client):
     assert stream_consultation(client, "auto") == [None, None]
+
+
+def test_websocket_answers_heartbeat_pings(client):
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+
+
+def test_pings_are_answered_while_stop_waits_for_the_last_transcriptions(client):
+    # The browser treats a server that stays silent for 5 s as a dead connection,
+    # so a slow final transcription must not hold up the heartbeat.
+    client.transcription.delay_s = 0.5
+    data = to_pcm16(consultation()).tobytes()
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_json({"type": "start"})
+        ws.receive_json()
+        for start in range(0, len(data), 1920):
+            ws.send_bytes(data[start : start + 1920])
+        ws.send_json({"type": "stop"})
+        ws.send_json({"type": "ping"})
+        replies = []
+        while (event := ws.receive_json())["type"] != "stopped":
+            replies.append(event["type"] if event["type"] != "chunk" else event["status"])
+
+    assert "pong" in replies
+    assert replies.index("pong") < replies.index("done")  # answered before the slow results arrived
 
 
 def test_websocket_rejects_oversized_audio_messages(client):

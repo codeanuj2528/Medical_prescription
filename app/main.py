@@ -16,6 +16,7 @@ from app.api.errors import register_error_handlers
 from app.config import PUBLIC_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per Groq request drowns the useful logs
 
 SECURITY_HEADERS = {
     "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",

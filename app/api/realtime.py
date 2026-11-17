@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
+import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from app.realtime.protocol import RetryCommand, StartCommand, StopCommand, parse_command
+from app.realtime.protocol import PingCommand, RetryCommand, StartCommand, StopCommand, parse_command
 from app.realtime.session import StreamingSession
 
 from .container import Container, get_ws_container
@@ -18,9 +21,40 @@ from .security import client_id, origin_allowed
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-MAX_AUDIO_MESSAGE_BYTES = 64_000  # ~2 s of 16 kHz PCM16; the browser sends ~60 ms at a time
+MAX_AUDIO_MESSAGE_BYTES = 64_000  # ~2 s of 16 kHz PCM16; the browser sends 100 ms (replays: ≤ 1 s) at a time
 POLICY_VIOLATION = 1008
 TRY_AGAIN_LATER = 1013
+ABNORMAL_CLOSURE = 1006  # the connection ended without a close frame
+
+
+class ConnectionLog:
+    """Logs every connection's lifetime and how it ended, per process.
+
+    On a serverless platform this is how a dropped connection shows up in the
+    logs: who closed it (close code), after how long, and on which instance.
+    """
+
+    def __init__(self) -> None:
+        self.instance = f"{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        self.open = 0
+
+    def opened(self) -> float:
+        self.open += 1
+        logger.info("WebSocket opened on instance %s (%d open)", self.instance, self.open)
+        return time.monotonic()
+
+    def closed(self, since: float, code: int | None) -> None:
+        self.open -= 1
+        logger.info(
+            "WebSocket closed after %.1f s with code %s on instance %s (%d open)",
+            time.monotonic() - since,
+            code if code is not None else ABNORMAL_CLOSURE,
+            self.instance,
+            self.open,
+        )
+
+
+connections = ConnectionLog()
 
 
 class WebSocketSink:
@@ -55,6 +89,8 @@ async def transcribe_stream(websocket: WebSocket, container: Annotated[Container
     await websocket.accept()
     sink = WebSocketSink(websocket)
     session: StreamingSession | None = None
+    stopping: asyncio.Task[None] | None = None
+    opened_at, close_code = connections.opened(), None
 
     def new_session(command: StartCommand | None = None) -> StreamingSession:
         command = command or StartCommand(type="start")
@@ -71,6 +107,7 @@ async def transcribe_stream(websocket: WebSocket, container: Annotated[Container
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
+                close_code = message.get("code")
                 break
 
             audio = message.get("bytes")
@@ -94,14 +131,26 @@ async def transcribe_stream(websocket: WebSocket, container: Annotated[Container
                 session = new_session(command)
                 await sink.send({"type": "ready"})
             elif isinstance(command, StopCommand):
-                if session:
-                    await session.finish()
-                await sink.send({"type": "stopped"})
+                # In the background, so this loop keeps answering pings while the
+                # last transcriptions finish (the browser treats a silent server as gone).
+                stopping = asyncio.create_task(_stop(session, sink))
             elif isinstance(command, RetryCommand) and session:
                 await session.retry(command.id)
-    except WebSocketDisconnect:
-        pass
+            elif isinstance(command, PingCommand):
+                await sink.send({"type": "pong"})
+    except WebSocketDisconnect as disconnect:
+        close_code = disconnect.code
     finally:
         sink.closed = True
+        connections.closed(opened_at, close_code)
+        if stopping:
+            stopping.cancel()
         if session:
             await session.close()
+
+
+async def _stop(session: StreamingSession | None, sink: WebSocketSink) -> None:
+    """Flush the last utterance, wait for every pending result, then say "stopped"."""
+    if session:
+        await session.finish()
+    await sink.send({"type": "stopped"})

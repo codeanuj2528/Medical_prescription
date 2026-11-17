@@ -8,15 +8,22 @@
  *   it reconnects at once (then with backoff), sends a fresh "start", and
  *   replays the audio the old connection never finished transcribing — so a
  *   drop costs a moment of delay, not lost words.
+ * - A connection can also die *silently* (still "open", but nothing gets
+ *   through). A heartbeat catches that: a "ping" every 2 s, and if the server
+ *   has said nothing at all for 5 s the connection is treated as dropped.
  * - Server messages are re-emitted as DOM events named after their "type".
  */
 const MAX_QUEUED_BYTES = 10 * 32_000; // 10 s of 16 kHz PCM16
 const STOP_TIMEOUT_MS = 20_000;
+const HEARTBEAT_MS = 2_000;
+const SILENT_SERVER_MS = 5_000; // the server normally talks ~10×/s (VAD telemetry), and answers every ping
 
 export class StreamClient extends EventTarget {
   #url;
   #ws = null;
   #active = false;
+  #stopping = false;
+  #sentAudio = false; // nothing to flush on stop if the mic never delivered audio
   #startPayload = () => ({});
   #replay = null;
   #connections = 0;
@@ -24,6 +31,8 @@ export class StreamClient extends EventTarget {
   #queuedBytes = 0;
   #retryDelay = 500;
   #reconnectTimer = null;
+  #heartbeat = null;
+  #lastHeardAt = 0;
   #stopWaiter = null;
 
   constructor(url = defaultUrl()) {
@@ -40,11 +49,13 @@ export class StreamClient extends EventTarget {
     this.#startPayload = startPayload;
     this.#replay = replay;
     this.#retryDelay = 0; // first reconnect is immediate
+    this.#heartbeat = setInterval(() => this.#checkHeartbeat(), HEARTBEAT_MS);
     this.#connect();
   }
 
   /** @param {Int16Array} pcm */
   sendAudio(pcm) {
+    this.#sentAudio = true;
     if (this.#ws?.readyState === WebSocket.OPEN) {
       this.#ws.send(pcm.buffer);
       return;
@@ -63,21 +74,32 @@ export class StreamClient extends EventTarget {
     this.#sendJson({ type: "retry", id: chunkId });
   }
 
-  /** Graceful stop: the server flushes the last utterance and finishes pending transcriptions. */
+  /**
+   * Graceful stop: the server flushes the last utterance and finishes pending
+   * transcriptions. If the connection drops while it does, it reconnects,
+   * replays the unfinished audio and asks again — the last sentence is not lost.
+   */
   async close() {
-    this.#active = false;
     clearTimeout(this.#reconnectTimer);
-    const ws = this.#ws;
-    if (ws?.readyState === WebSocket.OPEN) {
+    const reachable = this.#connections > 0 || this.#ws?.readyState === WebSocket.CONNECTING;
+    if (this.#active && this.#sentAudio && reachable) {
+      this.#stopping = true;
       const stopped = new Promise((resolve) => {
         this.#stopWaiter = resolve;
         setTimeout(resolve, STOP_TIMEOUT_MS);
       });
-      ws.send(JSON.stringify({ type: "stop" }));
+      if (this.#ws?.readyState === WebSocket.OPEN) this.#sendJson({ type: "stop" });
+      else if (this.#ws?.readyState !== WebSocket.CONNECTING) this.#connect(); // onopen sends the stop
       await stopped;
     }
-    ws?.close();
+    this.#active = false;
+    this.#stopping = false;
+    this.#stopWaiter = null;
+    clearTimeout(this.#reconnectTimer);
+    clearInterval(this.#heartbeat);
+    const ws = this.#ws;
     this.#ws = null;
+    ws?.close();
     this.#queue = [];
     this.#queuedBytes = 0;
   }
@@ -89,6 +111,7 @@ export class StreamClient extends EventTarget {
 
     ws.onopen = () => {
       this.#retryDelay = 0;
+      this.#lastHeardAt = performance.now();
       const reconnect = this.#connections++ > 0 && this.#replay !== null;
       // On a reconnect the replay already contains the audio queued while offline.
       const replay = reconnect ? this.#replay() : null;
@@ -99,9 +122,11 @@ export class StreamClient extends EventTarget {
       this.#queue = [];
       this.#queuedBytes = 0;
       this.#emit("connected", { reconnect, flushedBytes, fromMs: replay?.fromMs ?? null });
+      if (this.#stopping) ws.send(JSON.stringify({ type: "stop" })); // dropped while stopping: ask again
     };
 
     ws.onmessage = (event) => {
+      this.#lastHeardAt = performance.now();
       let message;
       try {
         message = JSON.parse(event.data);
@@ -113,14 +138,29 @@ export class StreamClient extends EventTarget {
     };
 
     ws.onclose = () => {
-      if (this.#ws !== ws) return;
-      this.#stopWaiter?.();
-      this.#emit("disconnected", {});
-      if (!this.#active) return;
-      this.#emit("reconnecting", { delayMs: this.#retryDelay });
-      this.#reconnectTimer = setTimeout(() => this.#connect(), this.#retryDelay);
-      this.#retryDelay = Math.min(Math.max(this.#retryDelay * 2, 500), 8_000);
+      if (this.#ws === ws) this.#dropped();
     };
+  }
+
+  /** Every 2 s: ping, and give up on a connection the server has gone silent on. */
+  #checkHeartbeat() {
+    const ws = this.#ws;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    if (performance.now() - this.#lastHeardAt > SILENT_SERVER_MS) {
+      ws.onclose = ws.onmessage = null; // a dead socket can take long to report "closed": don't wait
+      ws.close();
+      this.#dropped();
+      return;
+    }
+    ws.send(JSON.stringify({ type: "ping" }));
+  }
+
+  #dropped() {
+    this.#emit("disconnected", {});
+    if (!this.#active) return;
+    this.#emit("reconnecting", { delayMs: this.#retryDelay });
+    this.#reconnectTimer = setTimeout(() => this.#connect(), this.#retryDelay);
+    this.#retryDelay = Math.min(Math.max(this.#retryDelay * 2, 500), 8_000);
   }
 
   #sendJson(payload) {

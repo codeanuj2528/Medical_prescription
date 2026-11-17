@@ -283,8 +283,11 @@ export class ScribeApp {
       : Math.max(this.#timelineBaseMs, ...finishedEnds);
     fromMs = Math.max(fromMs, this.#recording.durationMs - MAX_REPLAY_MS, 0);
 
-    for (const chunk of unfinished) {
-      this.#chunks.delete(chunk.id); // re-transcribed from the replay under new ids
+    // Everything the replay covers is re-transcribed under new ids — including a
+    // later utterance that finished before an earlier one did (no duplicates).
+    const replayed = chunks.filter((c) => unfinished.includes(c) || (c.startMs ?? -1) >= fromMs);
+    for (const chunk of replayed) {
+      this.#chunks.delete(chunk.id);
       this.transcript.remove(chunk.id);
     }
     this.#renderStats();

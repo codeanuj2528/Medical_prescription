@@ -5,6 +5,7 @@ Browser → server
     {"type": "start", "chunkOffset": 12, "context": "...transcript tail...", "language": "auto" | "en" | "hi"}
     {"type": "stop"}            flush the last utterance, wait for pending results
     {"type": "retry", "id": 7}  re-send a failed utterance to the recogniser
+    {"type": "ping"}            heartbeat: proves the connection still works both ways
 
 Server → browser
     {"type": "ready"}
@@ -16,6 +17,7 @@ Server → browser
      "startMs": ..., "endMs": ..., "latencyMs": ..., "upstreamMs": ...}   final text
     {"type": "chunk", "id": 3, "status": "failed", "error": "..."}
     {"type": "stopped"}
+    {"type": "pong"}
     {"type": "error", "message": "..."}
 """
 
@@ -48,9 +50,14 @@ class RetryCommand(BaseModel):
     id: int
 
 
-Command = Annotated[StartCommand | StopCommand | RetryCommand, Field(discriminator="type")]
+class PingCommand(BaseModel):
+    type: Literal["ping"]
+
+
+AnyCommand = StartCommand | StopCommand | RetryCommand | PingCommand
+Command = Annotated[AnyCommand, Field(discriminator="type")]
 COMMAND_ADAPTER: TypeAdapter[Command] = TypeAdapter(Command)
 
 
-def parse_command(text: str) -> StartCommand | StopCommand | RetryCommand:
+def parse_command(text: str) -> AnyCommand:
     return COMMAND_ADAPTER.validate_json(text)
