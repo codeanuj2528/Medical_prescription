@@ -19,7 +19,7 @@ class FakeTranscriber:
         self.active = self.max_active = self.full_calls = self.previews = 0
         self._delays, self._fail_full_calls = list(delays), fail_full_calls
 
-    async def transcribe(self, wav, context="", language=None):
+    async def transcribe(self, wav, context="", language=None, optional=False):
         self.full_calls += 1
         call = self.full_calls
         self.contexts.append(context)
@@ -36,7 +36,7 @@ class FakeTranscriber:
         finally:
             self.active -= 1
 
-    async def preview(self, wav, language=None):
+    async def preview(self, wav, language=None, at_pause=False):
         self.previews += 1
         self.preview_languages.append(language)
         return TranscriptionResult(
@@ -130,8 +130,9 @@ async def test_chunk_offset_continues_numbering_after_a_reconnect(settings):
 
 
 async def test_failed_chunk_can_be_retried(settings):
-    # Both the eager pass and the fallback final fail → the chunk is marked failed.
-    session, events = make(settings, FakeTranscriber(fail_full_calls=2))
+    # No live text (so nothing on screen to fall back to) and the final fails → "failed".
+    no_live = replace(settings, live=replace(settings.live, enabled=False))
+    session, events = make(no_live, FakeTranscriber(fail_full_calls=1))
     await stream(session, concat(silence(600), voice(1000), silence(1000)))
     [failed] = chunk_events(events, "failed")
     assert "unavailable" in failed["error"]
@@ -179,11 +180,13 @@ async def test_final_reuses_the_eager_pass_when_speech_has_ended(settings):
 async def test_speech_after_a_short_pause_gets_a_fresh_final(settings):
     transcriber = FakeTranscriber()
     session, events = make(settings, transcriber)
-    # 300 ms pause: long enough for an eager pass, too short to end the utterance.
+    # 300 ms pause: long enough for an accurate pass, too short to end the utterance.
     await stream(session, speech(silence(600), voice(800), silence(300), voice(800), silence(1000)))
     assert [e["id"] for e in chunk_events(events, "done")] == [1]
     assert chunk_events(events, "done")[0]["text"] == "utterance 2"  # covers both halves
-    assert "utterance 1" in [e["text"] for e in chunk_events(events, "partial")]
+    assert transcriber.full_calls == 2  # mid-pause accurate pass was not reused: speech came after it
+    # Its text arrived after speech resumed, so it was (correctly) not shown as stale "final" text.
+    assert "utterance 1" not in [e["text"] for e in chunk_events(events, "partial")]
 
 
 async def test_live_text_can_be_switched_off(settings):
@@ -218,12 +221,32 @@ async def test_text_is_committed_at_the_pause_before_the_utterance_closes(settin
 
 async def test_previews_keep_the_language_already_heard_in_the_utterance(settings):
     class HindiTranscriber(FakeTranscriber):
-        async def transcribe(self, wav, context="", language=None):
-            result = await super().transcribe(wav, context, language)
+        async def transcribe(self, wav, context="", language=None, optional=False):
+            result = await super().transcribe(wav, context, language, optional)
             return replace(result, language="hi")
 
     transcriber = HindiTranscriber()
     session, _ = make(settings, transcriber)
     # A pause early on (eager pass hears Hindi), then a long stretch of speech (quick previews).
-    await stream(session, speech(silence(600), voice(900), silence(250), voice(3000), silence(1000)))
+    await stream(session, speech(silence(600), voice(900), silence(350), voice(3000), silence(1000)))
     assert transcriber.preview_languages and transcriber.preview_languages[-1] == "hi"
+
+
+async def test_fast_lane_is_rate_limited_on_choppy_speech(settings):
+    transcriber = FakeTranscriber()
+    session, _ = make(settings, transcriber)
+    # 15 short phrases with 100 ms gaps: a fast pass could fire at every gap, but the lane is throttled.
+    choppy = [part for _ in range(15) for part in (voice(250), silence(100))]
+    await stream(session, speech(silence(600), *choppy, silence(1000)))
+    duration_ms = 15 * 350
+    assert transcriber.previews <= duration_ms // settings.live.fast_min_gap_ms + 1
+
+
+async def test_final_keeps_the_on_screen_text_when_the_accurate_model_is_unavailable(settings):
+    # The accurate pass at the pause and the accurate final both fail (e.g. quota),
+    # but the fast text is already on screen: it becomes the final, nothing fails.
+    session, events = make(settings, FakeTranscriber(fail_full_calls=2))
+    await stream(session, speech(silence(600), voice(1000), silence(1000)))
+    assert chunk_events(events, "failed") == []
+    [done] = chunk_events(events, "done")
+    assert done["text"].startswith("preview")

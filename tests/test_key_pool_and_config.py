@@ -27,6 +27,16 @@ def test_key_pool_skips_cooling_keys_and_recovers():
     assert {pool.acquire(), pool.acquire()} == {"a", "b"}
 
 
+def test_key_pool_reports_how_long_until_a_key_is_free():
+    clock = FakeClock()
+    pool = KeyPool(["a", "b"], clock=clock)
+    assert pool.wait_time() == 0
+    pool.mark_rate_limited("a", 10)
+    assert pool.wait_time() == 0  # "b" is still free
+    pool.mark_rate_limited("b", 4)
+    assert pool.wait_time() == pytest.approx(4)
+
+
 def test_key_pool_falls_back_to_the_key_that_recovers_first():
     clock = FakeClock()
     pool = KeyPool(["a", "b"], clock=clock)

@@ -76,11 +76,13 @@ class LiveSettings:
     """Live text while someone is still talking. See app/realtime/session.py."""
 
     enabled: bool = True
-    eager_pause_ms: int = 60  # at a pause this long, transcribe the speech so far and show it at once
-    first_preview_ms: int = 900  # utterance length before the first quick preview (tiny clips → junk)
-    preview_every_ms: int = 700  # during continuous speech, refresh the live text this often
-    min_shown_voiced_ms: int = 500  # quick previews of less speech than this are not shown
-    preview_backoff_ms: int = 3_000  # after a failed preview (e.g. rate limit), pause previews this long
+    fast_pause_ms: int = 60  # fast lane: at a pause this long, put the speech so far on screen
+    fast_min_gap_ms: int = 300  # fast lane: one request at a time, at least this far apart
+    accurate_pause_ms: int = 250  # accurate lane: at a pause this long, final-quality transcription
+    first_preview_ms: int = 900  # utterance length before the first grey preview (tiny clips → junk)
+    preview_every_ms: int = 700  # during continuous speech, refresh the grey live text this often
+    min_shown_voiced_ms: int = 500  # grey previews of less speech than this are not shown
+    preview_backoff_ms: int = 3_000  # after a failed fast request (e.g. rate limit), pause the fast lane
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class Settings:
     stt_language: str | None = None  # default when the browser doesn't choose; None = auto-detect
     stt_expected_languages: tuple[str, ...] = ("en", "hi")  # auto-detect outside these is re-checked
     stt_concurrency: int = 4  # utterances transcribed in parallel per session
+    groq_rpm_per_key: int = 20  # Groq's requests/minute per model per key (free tier); budget scales with keys
     stt_timeout_s: float = 15.0
     llm_timeout_s: float = 45.0
     context_chars: int = 240  # transcript tail sent to Whisper as its prompt
@@ -122,6 +125,7 @@ class Settings:
             stt_language=None if language in ("", "auto") else language,
             stt_expected_languages=tuple(code for code in expected if code) or cls.stt_expected_languages,
             stt_concurrency=int(env.get("STT_CONCURRENCY", cls.stt_concurrency)),
+            groq_rpm_per_key=int(env.get("GROQ_RPM_PER_KEY", cls.groq_rpm_per_key)),
             allowed_origins=tuple(o.strip() for o in env.get("ALLOWED_ORIGINS", "").split(",") if o.strip()),
         )
 

@@ -37,6 +37,11 @@ class KeyPool:
                 return key
         return min(self._keys, key=lambda k: self._cooling_until.get(k, 0.0))
 
+    def wait_time(self) -> float:
+        """Seconds until at least one key is usable again (0 if one is free now)."""
+        now = self._clock()
+        return max(0.0, min(self._cooling_until.get(key, 0.0) for key in self._keys) - now)
+
     def mark_rate_limited(self, key: str, retry_after_s: float) -> None:
         self._cooling_until[key] = self._clock() + max(retry_after_s, self.MIN_COOLDOWN_S)
 

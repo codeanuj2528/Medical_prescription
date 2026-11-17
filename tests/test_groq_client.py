@@ -77,6 +77,33 @@ async def test_transcription_request_shape():
         assert part in captured["body"]
 
 
+async def test_waits_for_a_rate_limited_key_instead_of_failing():
+    responses = iter(
+        [
+            httpx.Response(429, headers={"retry-after": "0.1"}, json={"error": {"message": "slow down"}}),
+            httpx.Response(200, json={"text": "ok"}),
+        ]
+    )
+    client, _ = client_with(lambda request: next(responses), keys=("only-key",))
+    result = await client.transcribe(b"wav", model="m", language=None, prompt=None, timeout_s=5)
+    assert result == {"text": "ok"}
+
+
+async def test_best_effort_requests_fail_fast_on_rate_limits():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, headers={"retry-after": "5"}, json={"error": {"message": "slow down"}})
+
+    client, _ = client_with(handler, keys=("only-key",))
+    with pytest.raises(GroqError) as raised:
+        await client.transcribe(b"wav", model="m", language=None, prompt=None, timeout_s=5, may_wait=False)
+    assert raised.value.status == 429
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("headers", "expected"),
     [

@@ -31,6 +31,7 @@ def health() -> JSONResponse:
             "sttFastModel": settings.stt_fast_model,
             "llmModel": settings.llm_model,
             "groqKeys": len(settings.groq_keys),
+            "sttRequestsPerMinute": settings.groq_rpm_per_key * len(settings.groq_keys),
         }
     )
 

@@ -6,21 +6,20 @@
 
 Silence and noise stop at the segmenter; only speech reaches the recogniser.
 
-Making it feel instant (like talking to a person):
+Making it feel instant, with two lanes per utterance:
 
-* **Live previews** — while someone keeps talking, the utterance so far is
-  re-transcribed about once a second (one quick request) and shown as live
-  text, so words appear while they are still being spoken.
-* **Commit at the pause** — the moment a short pause (60 ms) appears, two
-  transcriptions of the utterance so far start together: the fast model's
-  text goes on screen as soon as it returns (~250 ms), and the accurate
-  model's text follows ~100–200 ms later and corrects it if they differ.
-  Neither waits for the 600 ms hangover, which only decides where one
-  utterance ends. If no more speech follows, the accurate result becomes the
-  final text (no extra request); if they keep talking, the text simply grows.
-* **Parallel** — every transcription is its own asyncio task; a semaphore
-  caps final-quality requests, so a long utterance never blocks the next one.
-  Results carry the utterance id and the browser keeps them in speech order.
+* **Fast lane** (fast model, one request, prompt-free) — at a 60 ms pause the
+  speech so far is transcribed and put on screen (~250 ms later); during
+  continuous speech it refreshes grey live text every ~0.7 s. One request at a
+  time, at least 300 ms apart, so the request rate stays within Groq limits.
+* **Accurate lane** (accurate model, language-aware) — at a 250 ms pause the
+  speech so far gets its final-quality transcription. Its text replaces the
+  fast text only while the speaker is still silent, and if no more speech
+  follows before the 600 ms hangover ends, it becomes the final text with no
+  extra request.
+* **Parallel** — every transcription is its own asyncio task; a semaphore caps
+  accurate requests, so a long utterance never blocks the next one. Results
+  carry the utterance id and the browser keeps them in speech order.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from app.audio.segmenter import SpeechSegment, SpeechSegmenter
 from app.audio.vad import EnergyVad, VadDecision
 from app.audio.wav import encode_wav, pcm16_to_float
 from app.config import Settings
-from app.stt.service import TranscriptionResult
+from app.stt.service import BudgetExhausted, TranscriptionResult
 
 from .errors import public_error_message
 
@@ -47,11 +46,17 @@ logger = logging.getLogger(__name__)
 EventSender = Callable[[dict[str, Any]], Awaitable[None]]
 T = TypeVar("T")
 
+TELEMETRY_BATCH_FRAMES = 5
+
 
 class Transcriber(Protocol):
-    async def transcribe(self, wav: bytes, context: str = "", language: str | None = None) -> TranscriptionResult: ...
+    async def transcribe(
+        self, wav: bytes, context: str = "", language: str | None = None, *, optional: bool = False
+    ) -> TranscriptionResult: ...
 
-    async def preview(self, wav: bytes, language: str | None = None) -> TranscriptionResult: ...
+    async def preview(
+        self, wav: bytes, language: str | None = None, *, at_pause: bool = False
+    ) -> TranscriptionResult: ...
 
 
 @dataclass
@@ -60,15 +65,19 @@ class LiveUtterance:
 
     id: int
     start_ms: int
-    requested: int = 0  # previews requested so far (eager passes included)
+    requested: int = 0  # transcriptions requested so far (both lanes)
     shown: int = 0  # newest of them already shown — older results arriving late are ignored
-    last_preview_at_ms: int = 0  # utterance length when the last quick preview was requested
-    eager_task: asyncio.Task[TranscriptionResult] | None = None
-    eager_voiced_ms: int = -1  # voiced audio the eager transcription covers
-    preview_running: bool = False
-    language: str | None = None  # language the last eager pass heard (keeps previews in one script)
+    fast_running: bool = False  # the fast lane runs one request at a time…
+    last_fast_at_ms: int = -10_000  # …and at least `fast_min_gap_ms` apart (stream time)
+    fast_voiced_ms: int = -1  # voiced audio covered by the last pause-time fast pass
+    last_preview_at_ms: int = 0  # utterance length at the last grey preview
+    eager_task: asyncio.Task[TranscriptionResult] | None = None  # the accurate lane's latest pass
+    eager_voiced_ms: int = -1  # voiced audio that accurate pass covers
+    language: str | None = None  # language the accurate lane heard (keeps fast text in one script)
     committed_voiced_ms: int = -1  # voiced audio covered by the text committed on screen at a pause
     committed_at: float = 0.0  # when that text was sent
+    committed_text: str = ""  # the newest text on screen for that speech…
+    committed_language: str | None = None  # …kept as the final's fallback when quota runs out
 
 
 class StreamingSession:
@@ -99,6 +108,7 @@ class StreamingSession:
         self._next_id = chunk_offset + 1
         self._last_voice_at = time.perf_counter()
         self._previews_paused_until_ms = 0
+        self._telemetry_buffer: list[list[float | int]] = []
         self.captured_ms = 0
         self.speech_ms = 0
 
@@ -108,7 +118,6 @@ class StreamingSession:
         """Accept raw PCM16 bytes of any length; analyse every complete 20 ms frame."""
         self._buffer.extend(data)
         frame_bytes = self._settings.audio.frame_bytes
-        telemetry: list[list[float | int]] = []
 
         while len(self._buffer) >= frame_bytes:
             pcm = np.frombuffer(bytes(self._buffer[:frame_bytes]), dtype="<i2")
@@ -118,19 +127,25 @@ class StreamingSession:
                 self._last_voice_at = time.perf_counter()
             segment = self._segmenter.push(pcm, decision.is_speech)
             self.captured_ms += self._settings.audio.frame_ms
-            telemetry.append(self._telemetry(decision))
+            self._telemetry_buffer.append(self._telemetry(decision))
             if segment is not None:
                 await self._finalize(segment)
             elif self._segmenter.in_speech:
                 await self._track_live()
 
-        if telemetry:
-            await self._send(
-                {"type": "vad", "frames": telemetry, "capturedMs": self.captured_ms, "speechMs": self.speech_ms}
-            )
+        if len(self._telemetry_buffer) >= TELEMETRY_BATCH_FRAMES:
+            await self._flush_telemetry()
+
+    async def _flush_telemetry(self) -> None:
+        """VAD telemetry goes out ~10× a second (5 frames per message), not once per 20 ms frame."""
+        if not self._telemetry_buffer:
+            return
+        frames, self._telemetry_buffer = self._telemetry_buffer, []
+        await self._send({"type": "vad", "frames": frames, "capturedMs": self.captured_ms, "speechMs": self.speech_ms})
 
     async def finish(self) -> None:
         """Mic stopped: finalise the utterance in progress and wait for every pending result."""
+        await self._flush_telemetry()
         segment = self._segmenter.flush()
         if segment is not None:
             await self._finalize(segment)
@@ -164,68 +179,76 @@ class StreamingSession:
         if not live_settings.enabled:
             return
 
-        live = self._live
-        if segmenter.trailing_silence_ms >= live_settings.eager_pause_ms:
-            if live.eager_voiced_ms != segmenter.voiced_ms:  # new speech since the last pause
-                live.eager_voiced_ms = voiced = segmenter.voiced_ms
-                pcm = segmenter.snapshot()
-                self._spawn(self._fast_commit(live, pcm, voiced))  # on screen first
-                live.eager_task = self._spawn(self._eager(live, pcm, voiced))  # accurate; becomes the final
-        elif self._quick_preview_due(live):
-            live.last_preview_at_ms = segmenter.open_length_ms
-            live.preview_running = True
-            self._spawn(self._quick_preview(live, segmenter.snapshot(), segmenter.voiced_ms))
+        live, silence, voiced = self._live, segmenter.trailing_silence_ms, segmenter.voiced_ms
+        if silence >= live_settings.accurate_pause_ms and live.eager_voiced_ms != voiced:
+            live.eager_voiced_ms = voiced
+            live.eager_task = self._spawn(self._accurate_pass(live, segmenter.snapshot(), voiced))
 
-    def _quick_preview_due(self, live: LiveUtterance) -> bool:
-        length, settings = self._segmenter.open_length_ms, self._settings.live
+        if not self._fast_lane_free(live):
+            return
+        if silence >= live_settings.fast_pause_ms:
+            if live.fast_voiced_ms != voiced:  # new speech since the last pause-time fast pass
+                live.fast_voiced_ms = voiced
+                self._start_fast_pass(live, stable=True)
+        elif self._grey_preview_due(live):
+            live.last_preview_at_ms = segmenter.open_length_ms
+            self._start_fast_pass(live, stable=False)
+
+    def _fast_lane_free(self, live: LiveUtterance) -> bool:
+        settings = self._settings.live
         return (
-            not live.preview_running
-            and self._segmenter.trailing_silence_ms == 0
-            and length >= settings.first_preview_ms
-            and length - live.last_preview_at_ms >= settings.preview_every_ms
+            not live.fast_running
+            and self.captured_ms - live.last_fast_at_ms >= settings.fast_min_gap_ms
             and self.captured_ms >= self._previews_paused_until_ms
         )
 
-    async def _eager(self, live: LiveUtterance, pcm: np.ndarray, voiced_ms: int) -> TranscriptionResult:
-        """Final-quality transcription at a pause; shown now, and reused as the final if speech ended."""
+    def _grey_preview_due(self, live: LiveUtterance) -> bool:
+        length, settings = self._segmenter.open_length_ms, self._settings.live
+        return length >= settings.first_preview_ms and length - live.last_preview_at_ms >= settings.preview_every_ms
+
+    def _start_fast_pass(self, live: LiveUtterance, *, stable: bool) -> None:
+        live.fast_running, live.last_fast_at_ms = True, self.captured_ms
+        self._spawn(self._fast_pass(live, self._segmenter.snapshot(), self._segmenter.voiced_ms, stable))
+
+    async def _fast_pass(self, live: LiveUtterance, pcm: np.ndarray, voiced_ms: int, stable: bool) -> None:
+        """Fast lane: quick text for the speech so far (normal text at a pause, grey while speaking)."""
         ticket = self._ticket(live)
-        async with self._parallel:
-            result = await self._transcriber.transcribe(
-                self._wav(pcm), context=self._context_before(live.id), language=self._language
+        try:
+            result = await self._transcriber.preview(
+                self._wav(pcm), language=self._language or live.language, at_pause=stable
             )
-        self._remember_language(live, result)
-        if await self._show_partial(live, ticket, result.text, voiced_ms, stable=True):
-            self._mark_committed(live, voiced_ms)
-        return result
-
-    async def _fast_commit(self, live: LiveUtterance, pcm: np.ndarray, voiced_ms: int) -> None:
-        """Fast-model text for the speech so far, shown as soon as the speaker pauses."""
-        ticket = self._ticket(live)
-        try:
-            result = await self._transcriber.preview(self._wav(pcm), language=self._language or live.language)
-        except Exception as error:  # the accurate pass is still coming
-            logger.info("Fast commit skipped: %s", error)
-            return
-        if await self._show_partial(live, ticket, result.text, voiced_ms, stable=True):
-            self._mark_committed(live, voiced_ms)
-
-    @staticmethod
-    def _mark_committed(live: LiveUtterance, voiced_ms: int) -> None:
-        """Remember when text for this much speech first reached the screen (for latency)."""
-        if live.committed_voiced_ms != voiced_ms:
-            live.committed_voiced_ms, live.committed_at = voiced_ms, time.perf_counter()
-
-    async def _quick_preview(self, live: LiveUtterance, pcm: np.ndarray, voiced_ms: int) -> None:
-        ticket = self._ticket(live)
-        try:
-            result = await self._transcriber.preview(self._wav(pcm), language=self._language or live.language)
-        except Exception as error:  # previews are best-effort; back off and let finals have the quota
-            logger.info("Live preview skipped: %s", error)
+        except BudgetExhausted:
+            return  # quota is short: skip quietly, the budget itself decides when to try again
+        except Exception as error:  # a real failure (e.g. Groq 429): back off so the accurate lane keeps the quota
+            logger.info("Fast pass skipped: %s", error)
             self._previews_paused_until_ms = self.captured_ms + self._settings.live.preview_backoff_ms
             return
         finally:
-            live.preview_running = False
-        await self._show_partial(live, ticket, result.text, voiced_ms)
+            live.fast_running = False
+        if await self._show_partial(live, ticket, result.text, voiced_ms, stable=stable) and stable:
+            self._mark_committed(live, voiced_ms, result)
+
+    async def _accurate_pass(self, live: LiveUtterance, pcm: np.ndarray, voiced_ms: int) -> TranscriptionResult:
+        """Accurate lane: final-quality text at a real pause; reused as the final if speech has ended."""
+        ticket = self._ticket(live)
+        async with self._parallel:
+            # Optional: skipped when the request budget is short; the final is then made at the end.
+            result = await self._transcriber.transcribe(
+                self._wav(pcm), context=self._context_before(live.id), language=self._language, optional=True
+            )
+        self._remember_language(live, result)
+        # Only while they are still silent: if speech resumed, this text is already incomplete.
+        still_paused = self._live is live and self._segmenter.voiced_ms == voiced_ms
+        if still_paused and await self._show_partial(live, ticket, result.text, voiced_ms, stable=True):
+            self._mark_committed(live, voiced_ms, result)
+        return result
+
+    @staticmethod
+    def _mark_committed(live: LiveUtterance, voiced_ms: int, result: TranscriptionResult) -> None:
+        """Remember what text for this much speech is on screen, and when it first got there."""
+        if live.committed_voiced_ms != voiced_ms:
+            live.committed_voiced_ms, live.committed_at = voiced_ms, time.perf_counter()
+        live.committed_text, live.committed_language = result.text, result.language
 
     async def _show_partial(
         self, live: LiveUtterance, ticket: int, text: str, voiced_ms: int, *, stable: bool = False
@@ -274,22 +297,12 @@ class StreamingSession:
         live: LiveUtterance | None = None,
     ) -> None:
         result = await self._reuse(eager)
+        error: Exception | None = None
         if result is None:
-            try:
-                async with self._parallel:
-                    result = await self._transcriber.transcribe(
-                        self._wav(segment.pcm), context=self._context_before(chunk_id), language=self._language
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # every failure becomes a "failed" chunk the user can retry
-                logger.warning("Transcription of chunk %s failed: %s", chunk_id, error)
-                self._failed[chunk_id] = segment
-                self._finished.add(chunk_id)
-                await self._send(
-                    {"type": "chunk", "id": chunk_id, "status": "failed", "error": public_error_message(error)}
-                )
-                return
+            result, error = await self._final_transcription(chunk_id, segment, live)
+        if result is None:
+            await self._fail(chunk_id, segment, error)
+            return
 
         self._texts[chunk_id] = result.text
         self._finished.add(chunk_id)
@@ -311,6 +324,44 @@ class StreamingSession:
                 "upstreamMs": result.upstream_ms,
             }
         )
+
+    async def _final_transcription(
+        self, chunk_id: int, segment: SpeechSegment, live: LiveUtterance | None
+    ) -> tuple[TranscriptionResult | None, Exception | None]:
+        """Accurate text for the whole utterance.
+
+        If text for exactly this speech is already on screen, the request is
+        optional: when the quota is short (or Groq rate-limits it) it is skipped
+        and the on-screen text becomes the final — no waiting, no failure.
+        """
+        on_screen = live is not None and live.committed_voiced_ms == segment.voiced_ms and bool(live.committed_text)
+        try:
+            async with self._parallel:
+                result = await self._transcriber.transcribe(
+                    self._wav(segment.pcm),
+                    context=self._context_before(chunk_id),
+                    language=self._language,
+                    optional=on_screen,
+                )
+            return result, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not on_screen or live is None:
+                return None, error
+            logger.info("Chunk %s keeps the text already on screen as final: %s", chunk_id, error)
+            fallback = TranscriptionResult(
+                text=live.committed_text, language=live.committed_language, audio_ms=segment.duration_ms, upstream_ms=0
+            )
+            return fallback, None
+
+    async def _fail(self, chunk_id: int, segment: SpeechSegment, error: Exception | None) -> None:
+        """Every failure becomes a "failed" chunk the user can retry."""
+        logger.warning("Transcription of chunk %s failed: %s", chunk_id, error)
+        self._failed[chunk_id] = segment
+        self._finished.add(chunk_id)
+        message = public_error_message(error) if error else "Transcription failed."
+        await self._send({"type": "chunk", "id": chunk_id, "status": "failed", "error": message})
 
     @staticmethod
     async def _reuse(eager: asyncio.Task[TranscriptionResult] | None) -> TranscriptionResult | None:

@@ -157,6 +157,13 @@ async def test_preview_is_a_single_request_on_the_fast_model():
     assert groq.calls[0]["model"] == "whisper-large-v3-turbo"
 
 
+async def test_preview_never_sends_a_prompt_even_in_hindi():
+    groq = FakeGroq({"hi": whisper("मुझे बुखार", "Hindi")})
+    await service(groq).preview(b"wav", language="hi")
+    assert groq.calls[0]["prompt"] is None  # no prompt words leaking into cut-off audio
+    assert groq.calls[0]["may_wait"] is False  # best-effort: never queue behind rate limits
+
+
 async def test_final_transcription_uses_the_accurate_model():
     groq = FakeGroq({"en": whisper("Good morning", "English")})
     await service(groq).transcribe(b"wav", language="en")

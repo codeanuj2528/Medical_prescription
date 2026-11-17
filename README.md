@@ -29,7 +29,8 @@ pauses), streamed in real time over the WebSocket with
 |---|---|---|
 | Utterances transcribed | 13 / 13, word-exact | 7 / 7, Hindi in Devanagari, English terms kept in English |
 | Audio filtered by the VAD (never sent) | 11.7 s | 6.9 s |
-| **Last spoken word → its text on screen** | **≈ 305 ms** (p95 ≈ 345 ms) | **≈ 305 ms** (p95 ≈ 335 ms) |
+| **Last spoken word → its text on screen** (10 keys) | **≈ 305 ms** (p95 ≈ 345 ms) | **≈ 305 ms** (p95 ≈ 335 ms) |
+| Same, **one free Groq key**, run back-to-back | ≈ 620 ms (p95 ≈ 950 ms), 0 failures | ≈ 400 ms (p95 ≈ 660 ms), 0 failures |
 | Grey live text while still speaking | updates every ≈ 0.7 s | same |
 | AI summary (2 parallel extractors) | ≈ 1.1–1.4 s | ≈ 1.2–1.5 s |
 
@@ -38,7 +39,8 @@ penicillin से allergy है।"* — the summary then lists Metformin 500 m
 medication, frequency left blank because it wasn't said) and a penicillin allergy.
 
 About 60 ms of that is noticing the pause and ~240 ms is Groq's own Whisper
-time — the practical floor for a non-streaming model. 98 tests pass
+time — the practical floor for a non-streaming model. With a single free key
+the request budget (below) trims live work so nothing ever fails. 112 tests pass
 (`pytest`), `ruff` clean.
 
 ## How the VAD works
@@ -85,18 +87,40 @@ and word endings. The VAD already gates noise and Whisper is robust to it.
 
 [`session.py`](app/realtime/session.py) shows text before an utterance is over:
 
-* **Live previews** — while someone keeps talking, the utterance so far is
-  re-transcribed every ≈ 0.7 s with the fast model and shown in grey.
-* **Commit at the pause** — as soon as a 60 ms pause appears, two transcriptions
-  of the speech so far start together: `whisper-large-v3-turbo` (its text goes
-  on screen ≈ 250 ms later) and the accurate `whisper-large-v3` (≈ 100–200 ms
-  later; it corrects the fast text where they differ). Nothing waits for the
-  600 ms **hangover** — that only decides where one utterance ends (so natural
-  mid-sentence pauses don't chop sentences). If no more speech follows, the
-  accurate result becomes the final text with no extra request.
+Two lanes per utterance:
+
+* **Fast lane** — `whisper-large-v3-turbo`, one prompt-free request at a time,
+  at least 300 ms apart. At a **60 ms pause** the speech so far is transcribed
+  and put on screen ≈ 250 ms later; during continuous speech it refreshes grey
+  live text every ≈ 0.7 s.
+* **Accurate lane** — `whisper-large-v3`, language-aware. At a **250 ms pause**
+  the speech so far gets its final-quality transcription; it replaces the fast
+  text while the speaker is still silent. If no more speech follows before the
+  600 ms **hangover** ends (the hangover only decides where an utterance ends,
+  so natural mid-sentence pauses don't chop sentences), it becomes the final
+  text with no extra request.
 * Junk guards: no grey text for under 0.5 s of speech, previews "heard" in an
   unexpected language (e.g. Japanese on half a second of Hindi) are dropped,
   stale results never overwrite newer ones or the final.
+
+## Request budget — works even with one free Groq key
+
+Groq's free tier allows **20 requests per minute per model per key** (measured:
+20 back-to-back requests, then HTTP 429 "try again in 3s").
+[`stt/budget.py`](app/stt/budget.py) mirrors that with a token bucket per model,
+sized by the number of keys:
+
+* **final text always runs**; 50 % of each budget is kept for it;
+* text at pauses runs while > 50 % is left; grey previews only while > 70 % is
+  left, so they are the first thing dropped; the speculative Hindi pass needs
+  spare budget too;
+* every 429 from Groq drains the matching bucket (a restarted or second server
+  instance can't know Groq's real count otherwise);
+* if the accurate final can't run, the fast text already on screen becomes the
+  final — slower or less polished, never failed.
+
+With 10 keys nothing is skipped; with one key the app quietly does less live
+work. `GROQ_RPM_PER_KEY` adjusts the limit for paid tiers.
 
 ## Languages — English, Hindi, Hinglish
 
@@ -156,6 +180,7 @@ app/
     key_pool.py           round-robin keys with 429 cooldowns
     hallucination.py      drops Whisper's invented text (and echoes of its prompt)
     language.py           language codes + detection safety net
+    budget.py             per-model request budget (token bucket synced with Groq 429s)
     service.py            TranscriptionService: speculative decoding, previews, prompts
   summary/
     schemas.py            Pydantic models (MedicalSummary, request/response)
@@ -179,7 +204,7 @@ public/                   static frontend (no build step)
   js/core/                MicCapture, StreamClient (reconnect), Recording, api
   js/ui/                  Waveform, TranscriptView, SummaryView, Toaster
 scripts/simulate_stream.py  stream any WAV through the live pipeline + report
-tests/                    98 pytest tests (VAD, segmenter, session, languages, API, …)
+tests/                    112 pytest tests (VAD, segmenter, session, languages, API, …)
 ```
 
 The browser does **no** audio analysis — it only captures, converts and
@@ -201,7 +226,7 @@ needs `localhost` or HTTPS.)
 ## Test
 
 ```bash
-uv run pytest                    # 98 tests, ~1 s, no network needed
+uv run pytest                    # 112 tests, ~2 s, no network needed
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -225,12 +250,13 @@ served from the CDN, and WebSockets run on Fluid Compute.
 npm i -g vercel
 vercel login
 vercel link
-vercel env add GROQ_API_KEYS production     # paste: gsk_a,gsk_b,...
+vercel env add GROQ_API_KEYS production     # one key works; several (gsk_a,gsk_b,…) = faster live text
 vercel deploy --prod
 ```
 
 `vercel.json` pins the region, sets `maxDuration: 300` for the function and
-adds security headers. A WebSocket lives at most as long as the function's
+adds security headers. `uvicorn[standard]` is a runtime dependency on purpose:
+Vercel's Python runtime needs a WebSocket implementation installed. A WebSocket lives at most as long as the function's
 max duration (300 s on Hobby); the client then **reconnects automatically**
 and resumes with the same chunk numbering and transcript context, so long
 consultations keep working.
@@ -265,13 +291,13 @@ Interactive docs: `/api/docs`.
 * **VAD on the server, not in the browser.** Raw audio goes to *our* server;
   only speech goes to the recogniser. All logic stays in one tested Python
   codebase, and the same code powers the simulator script.
-* **WebSocket instead of uploading files.** Audio streams continuously in 60 ms
-  chunks, so the server can preview, eagerly transcribe and finalise without waiting.
-* **Request budget.** Speed costs requests: ≈ 2.8 Whisper requests per second
-  of speech (live previews + a fast and an accurate pass at every pause).
-  Groq's free tier allows ≈ 2,000 requests per key per day, so 10 keys cover
-  roughly two hours of speech a day. Previews back off for 3 s after any failure
-  so finals keep the quota; tune `LiveSettings` in `config.py` to trade speed for requests.
+* **WebSocket instead of uploading files.** Audio streams continuously in 20 ms
+  chunks (VAD telemetry comes back batched ~10× a second), so the server can
+  preview, transcribe at pauses and finalise without waiting.
+* **Speed costs requests.** With enough keys, live text uses ≈ 1–2 Whisper
+  requests per second of speech; the request budget scales that down to fit
+  whatever quota exists. Groq's free tier also caps ≈ 2,000 requests per key
+  per day. Tune `LiveSettings` in `config.py` to trade speed for requests.
 * **Safety.** Origin check on the API and WebSocket (other sites can't spend the
   Groq quota through a visitor's browser), per-IP rate limits, message size
   limits, uniform errors that never leak internals, audio kept only in memory.

@@ -19,12 +19,12 @@ class FakeTranscription:
         self.calls = 0
         self.languages = []
 
-    async def transcribe(self, wav, context="", language=None):
+    async def transcribe(self, wav, context="", language=None, optional=False):
         self.calls += 1
         self.languages.append(language)
         return TranscriptionResult(text=f"utterance {self.calls}", language=language, audio_ms=1000, upstream_ms=3)
 
-    async def preview(self, wav, language=None):
+    async def preview(self, wav, language=None, at_pause=False):
         return TranscriptionResult(text="live preview", language=language, audio_ms=500, upstream_ms=1)
 
 
@@ -68,6 +68,7 @@ def test_health_reports_configuration_without_secrets(client):
         "status": "ok",
         "sttModel": "whisper-large-v3",
         "sttFastModel": "whisper-large-v3-turbo",
+        "sttRequestsPerMinute": 40,
         "llmModel": "openai/gpt-oss-120b",
         "groqKeys": 2,
     }
