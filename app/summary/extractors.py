@@ -48,8 +48,10 @@ ASSESSMENT = Extractor(
 stated or the patient is referred to as "he"/"she" — never guess it from the name. Otherwise "".
 - clinical_summary: 2–4 sentence third-person narrative (presentation, key findings, assessment, plan).
 - chief_complaints: main reasons for the visit, each with duration if given, e.g. "Fever for 3 days".
-- symptoms: symptoms the patient reports, including pertinent negatives written as "No vomiting". \
-Do not list vitals, exam findings, diagnoses, history or allergies here.
+- symptoms: what the patient feels or notices now (e.g. "Fever", "Dry cough", "Headache"), including \
+pertinent negatives written as "No vomiting". Chronic conditions (e.g. diabetes), allergies, current \
+medicines, vitals, exam findings and diagnoses are NOT symptoms — another assistant records history, \
+allergies and medicines, so leave them out even when said in the same sentence.
 - clinical_impression: the diagnosis the doctor states. If none is stated but one is strongly implied, \
 write "Suggested: <impression>". Otherwise "".""",
 )
@@ -62,8 +64,9 @@ CARE_PLAN = Extractor(
 frequency ("twice daily" / "1-0-1"), duration ("5 days"), instructions ("after food"). Any part that was not \
 said stays "" — e.g. "I take metformin 500" gives frequency "". \
 Medicines the patient already takes go here too with instructions "Current medication".
-- examinations: examination findings and vitals stated (e.g. "BP 130/85 mmHg") and tests done or advised \
-(e.g. "CBC advised").
+- examinations: examination findings and vitals the doctor states (e.g. "BP 130/85 mmHg") and tests done \
+or advised (e.g. "CBC advised"). Symptoms the patient reports are not examinations: if nothing was examined \
+or tested, [].
 - allergies: drug/food allergies. If the patient explicitly denies allergies: ["No known allergies"].
 - past_medical_history: chronic illnesses, past surgeries/hospitalisations, relevant family or social history.
 - follow_up: follow-up timing, lifestyle advice, warning signs to return for, referrals.""",
