@@ -1,6 +1,8 @@
 import { escapeHtml, icon } from "../util.js";
 
-/** Every summary section after "Clinical Summary", described once. */
+const NOT_MENTIONED = "Not mentioned in the conversation"; // empty field once a summary exists
+
+/** Every summary section after "Clinical Summary", described once; `empty` shows before any summary. */
 const SECTIONS = [
   { field: "chief_complaints", title: "Chief Complaints", icon: "messages-square", kind: "bullets", empty: "No complaints extracted yet" },
   { field: "symptoms", title: "Symptoms", icon: "thermometer", kind: "chips", empty: "No symptoms extracted yet" },
@@ -75,7 +77,7 @@ export class SummaryView {
       this.#bodies.get(section.field).innerHTML = loading
         ? SKELETON
         : isEmpty(value)
-          ? `<p class="empty">${section.empty}</p>`
+          ? `<p class="empty">${summary ? NOT_MENTIONED : section.empty}</p>`
           : RENDERERS[section.kind](value);
     }
 
