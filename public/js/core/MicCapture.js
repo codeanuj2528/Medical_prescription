@@ -1,12 +1,14 @@
 /**
- * Microphone → 16 kHz mono int16 PCM chunks (20 ms each).
+ * Microphone → 16 kHz mono int16 PCM chunks (100 ms each).
  *
  * The AudioContext is opened at 16 kHz so the browser's own high-quality
  * resampler does the work; browsers that refuse (older Firefox) fall back to
  * the device rate and the worklet resamples instead.
  */
 const SAMPLE_RATE = 16_000;
-const CHUNK_SAMPLES = 320; // 20 ms — one VAD frame: the server sees speech (and silence) without delay
+// 100 ms per WebSocket message: Vercel's WebSocket proxy drops connections far more
+// often at 50 messages/s than at 10; the cost is ≤ 100 ms later pause detection.
+const CHUNK_SAMPLES = 1600;
 const WORKLET_URL = "/worklets/pcm-capture.worklet.js";
 
 // Browser "call" processing (noise suppression, echo cancellation) is tuned for

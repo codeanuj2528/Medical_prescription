@@ -28,6 +28,31 @@ export class Recording {
     this.#samples = 0;
   }
 
+  /**
+   * PCM from `fromMs` to now as ≤ 1 s views (WebSocket-message sized), for
+   * replaying audio a dropped connection never finished transcribing.
+   * @returns {Int16Array[]}
+   */
+  sliceFrom(fromMs) {
+    const start = Math.max(0, Math.round((fromMs / 1000) * this.sampleRate));
+    const pieces = [];
+    let offset = 0;
+    for (const chunk of this.#chunks) {
+      const end = offset + chunk.length;
+      if (end > start) pieces.push(chunk.subarray(Math.max(0, start - offset)));
+      offset = end;
+    }
+    const merged = new Int16Array(pieces.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const piece of pieces) {
+      merged.set(piece, at);
+      at += piece.length;
+    }
+    const views = [];
+    for (let i = 0; i < merged.length; i += this.sampleRate) views.push(merged.subarray(i, i + this.sampleRate));
+    return views;
+  }
+
   /** 44-byte RIFF header + PCM16 data (chunks are already little-endian int16). */
   toWavBlob() {
     const dataBytes = this.#samples * 2;

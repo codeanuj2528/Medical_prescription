@@ -29,7 +29,7 @@ pauses), streamed in real time over the WebSocket with
 |---|---|---|
 | Utterances transcribed | 13 / 13, word-exact | 7 / 7, Hindi in Devanagari, English terms kept in English |
 | Audio filtered by the VAD (never sent) | 11.7 s | 6.9 s |
-| **Last spoken word → its text on screen** (10 keys) | **≈ 305 ms** (p95 ≈ 345 ms) | **≈ 305 ms** (p95 ≈ 335 ms) |
+| **Last spoken word → its text on screen** (8+ keys) | **≈ 305 ms** (p95 ≈ 345 ms) | **≈ 305 ms** (p95 ≈ 335 ms) |
 | Same, **one free Groq key**, run back-to-back | ≈ 620 ms (p95 ≈ 950 ms), 0 failures | ≈ 400 ms (p95 ≈ 660 ms), 0 failures |
 | Grey live text while still speaking | updates every ≈ 0.7 s | same |
 | AI summary (2 parallel extractors) | ≈ 1.1–1.4 s | ≈ 1.2–1.5 s |
@@ -119,8 +119,9 @@ sized by the number of keys:
 * if the accurate final can't run, the fast text already on screen becomes the
   final — slower or less polished, never failed.
 
-With 10 keys nothing is skipped; with one key the app quietly does less live
-work. `GROQ_RPM_PER_KEY` adjusts the limit for paid tiers.
+With 8+ keys nothing is skipped; with one key the app quietly does less live
+work, and a final whose accurate model is rate-limited is written by the fast
+model instead of waiting. `GROQ_RPM_PER_KEY` adjusts the limit for paid tiers.
 
 ## Languages — English, Hindi, Hinglish
 
@@ -201,7 +202,7 @@ public/                   static frontend (no build step)
   index.html, css/app.css
   worklets/pcm-capture.worklet.js   mic → 16 kHz PCM16 on the audio thread
   js/ScribeApp.js         UI controller (state + wiring only)
-  js/core/                MicCapture, StreamClient (reconnect), Recording, api
+  js/core/                MicCapture, StreamClient (reconnect + replay), Recording, api
   js/ui/                  Waveform, TranscriptView, SummaryView, Toaster
 scripts/simulate_stream.py  stream any WAV through the live pipeline + report
 tests/                    112 pytest tests (VAD, segmenter, session, languages, API, …)
@@ -256,10 +257,17 @@ vercel deploy --prod
 
 `vercel.json` pins the region, sets `maxDuration: 300` for the function and
 adds security headers. `uvicorn[standard]` is a runtime dependency on purpose:
-Vercel's Python runtime needs a WebSocket implementation installed. A WebSocket lives at most as long as the function's
-max duration (300 s on Hobby); the client then **reconnects automatically**
-and resumes with the same chunk numbering and transcript context, so long
-consultations keep working.
+Vercel's Python runtime needs a WebSocket implementation installed.
+
+**Dropped connections are expected on Vercel and handled.** A WebSocket ends at
+the function's max duration (300 s on Hobby), and in testing Vercel's proxy also
+dropped Python WebSocket connections without a close frame (more often at 50
+messages/s than at 10 — hence 100 ms audio messages), with no error in the
+function logs. The browser reconnects immediately, starts a fresh session with
+the same chunk numbering and transcript context, and **replays the audio the old
+connection never finished** (from the start of the first unfinished utterance,
+held in the in-memory recording). Verified by restarting the server mid-stream:
+every utterance transcribed once, in order, nothing lost.
 
 ## API
 
@@ -291,8 +299,8 @@ Interactive docs: `/api/docs`.
 * **VAD on the server, not in the browser.** Raw audio goes to *our* server;
   only speech goes to the recogniser. All logic stays in one tested Python
   codebase, and the same code powers the simulator script.
-* **WebSocket instead of uploading files.** Audio streams continuously in 20 ms
-  chunks (VAD telemetry comes back batched ~10× a second), so the server can
+* **WebSocket instead of uploading files.** Audio streams continuously in 100 ms
+  messages (VAD telemetry comes back batched ~10× a second), so the server can
   preview, transcribe at pauses and finalise without waiting.
 * **Speed costs requests.** With enough keys, live text uses ≈ 1–2 Whisper
   requests per second of speech; the request budget scales that down to fit

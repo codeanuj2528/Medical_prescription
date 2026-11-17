@@ -41,6 +41,12 @@ export class TranscriptView {
     this.#scrollToEnd();
   }
 
+  remove(id) {
+    this.#rows.get(id)?.remove();
+    this.#rows.delete(id);
+    this.#refreshPlaceholder();
+  }
+
   clear() {
     this.#rows.clear();
     this.#list.replaceChildren();

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.audio.wav import decode_wav, resample
 
 SAMPLE_RATE = 16_000
-CHUNK_MS = 20  # same as the browser
+CHUNK_MS = 100  # same as the browser
 
 
 @dataclass

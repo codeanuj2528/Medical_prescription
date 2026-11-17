@@ -12,6 +12,7 @@ import { copyText, countWords, downloadBlob, formatClock, icon, timestampSlug } 
 const MIN_TRANSCRIPT_CHARS = 20;
 const CONTEXT_CHARS = 240;
 const BYTES_PER_MS = 32; // 16 kHz × 2 bytes
+const MAX_REPLAY_MS = 30_000; // never resend more than this after a reconnect
 const LANGUAGE_KEY = "mediscribe.language";
 
 /**
@@ -104,12 +105,15 @@ export class ScribeApp {
     const stream = new StreamClient();
     this.#wireStream(stream);
     this.#stream = stream;
-    stream.open(() => ({
-      type: "start",
-      chunkOffset: this.#lastChunkId,
-      context: this.#transcriptText().slice(-CONTEXT_CHARS),
-      language: this.el.language.value,
-    }));
+    stream.open(
+      () => ({
+        type: "start",
+        chunkOffset: this.#lastChunkId,
+        context: this.#transcriptText().slice(-CONTEXT_CHARS),
+        language: this.el.language.value,
+      }),
+      () => this.#prepareReplay(),
+    );
 
     try {
       await this.#mic.start(
@@ -216,8 +220,9 @@ export class ScribeApp {
   #wireStream(stream) {
     stream.addEventListener("connected", (e) => {
       this.#connection++;
-      this.#timelineBaseMs = Math.max(0, this.#recording.durationMs - e.detail.flushedBytes / BYTES_PER_MS);
-      if (this.#connection > 1) this.toast.show("Reconnected — transcription continues.", "success");
+      this.#timelineBaseMs = e.detail.reconnect
+        ? e.detail.fromMs
+        : Math.max(0, this.#recording.durationMs - e.detail.flushedBytes / BYTES_PER_MS);
       this.#renderChip(false);
     });
     stream.addEventListener("vad", (e) => {
@@ -226,9 +231,8 @@ export class ScribeApp {
     });
     stream.addEventListener("chunk", (e) => this.#onChunk(e.detail));
     stream.addEventListener("error", (e) => this.toast.show(e.detail.message, "error"));
-    stream.addEventListener("disconnected", () => {
-      if (this.#status === "listening") this.#failPendingChunks("Connection lost before this chunk was transcribed.");
-    });
+    // A drop while listening is repaired by the reconnect + replay (see #prepareReplay);
+    // pending chunks are only failed if the session stops before that happens.
     stream.addEventListener("reconnecting", () => {
       if (this.#status === "listening") this.#renderChip(false, true);
     });
@@ -263,6 +267,28 @@ export class ScribeApp {
     this.transcript.upsert(chunk);
     this.#renderStats();
     this.#renderControls();
+  }
+
+  /**
+   * Called when a dropped connection reconnects: drop the chunks it never
+   * finished and return the audio to send again, from the start of the first
+   * unfinished utterance (or the end of the last finished one).
+   */
+  #prepareReplay() {
+    const chunks = [...this.#chunks.values()];
+    const unfinished = chunks.filter((c) => c.status === "pending" || c.status === "partial");
+    const finishedEnds = chunks.filter((c) => c.status === "done" && c.endMs != null).map((c) => c.endMs);
+    let fromMs = unfinished.length
+      ? Math.min(...unfinished.map((c) => c.startMs ?? this.#timelineBaseMs))
+      : Math.max(this.#timelineBaseMs, ...finishedEnds);
+    fromMs = Math.max(fromMs, this.#recording.durationMs - MAX_REPLAY_MS, 0);
+
+    for (const chunk of unfinished) {
+      this.#chunks.delete(chunk.id); // re-transcribed from the replay under new ids
+      this.transcript.remove(chunk.id);
+    }
+    this.#renderStats();
+    return { fromMs, chunks: this.#recording.sliceFrom(fromMs) };
   }
 
   #failPendingChunks(reason) {

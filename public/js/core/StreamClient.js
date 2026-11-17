@@ -3,9 +3,11 @@
  *
  * - Audio captured before the socket is open (or while reconnecting) is
  *   queued, up to ~10 s, and flushed in order once connected.
- * - If the connection drops while recording (network blip, or the serverless
- *   function reaching its max duration) it reconnects with backoff and sends
- *   a fresh "start" with the current chunk offset and transcript tail.
+ * - If the connection drops while recording (network blip, the serverless
+ *   function reaching its max duration, or the platform's proxy dropping it)
+ *   it reconnects at once (then with backoff), sends a fresh "start", and
+ *   replays the audio the old connection never finished transcribing — so a
+ *   drop costs a moment of delay, not lost words.
  * - Server messages are re-emitted as DOM events named after their "type".
  */
 const MAX_QUEUED_BYTES = 10 * 32_000; // 10 s of 16 kHz PCM16
@@ -16,6 +18,8 @@ export class StreamClient extends EventTarget {
   #ws = null;
   #active = false;
   #startPayload = () => ({});
+  #replay = null;
+  #connections = 0;
   #queue = [];
   #queuedBytes = 0;
   #retryDelay = 500;
@@ -27,10 +31,15 @@ export class StreamClient extends EventTarget {
     this.#url = url;
   }
 
-  /** @param {() => object} startPayload  called on every (re)connect */
-  open(startPayload) {
+  /**
+   * @param {() => object} startPayload  called on every (re)connect
+   * @param {() => {fromMs: number, chunks: Int16Array[]}} [replay]  on reconnects: audio to send again
+   */
+  open(startPayload, replay = null) {
     this.#active = true;
     this.#startPayload = startPayload;
+    this.#replay = replay;
+    this.#retryDelay = 0; // first reconnect is immediate
     this.#connect();
   }
 
@@ -79,13 +88,17 @@ export class StreamClient extends EventTarget {
     this.#ws = ws;
 
     ws.onopen = () => {
-      this.#retryDelay = 500;
+      this.#retryDelay = 0;
+      const reconnect = this.#connections++ > 0 && this.#replay !== null;
+      // On a reconnect the replay already contains the audio queued while offline.
+      const replay = reconnect ? this.#replay() : null;
       ws.send(JSON.stringify(this.#startPayload()));
       const flushedBytes = this.#queuedBytes;
-      for (const buffer of this.#queue) ws.send(buffer);
+      if (replay) for (const view of replay.chunks) ws.send(view);
+      else for (const buffer of this.#queue) ws.send(buffer);
       this.#queue = [];
       this.#queuedBytes = 0;
-      this.#emit("connected", { flushedBytes });
+      this.#emit("connected", { reconnect, flushedBytes, fromMs: replay?.fromMs ?? null });
     };
 
     ws.onmessage = (event) => {
@@ -106,7 +119,7 @@ export class StreamClient extends EventTarget {
       if (!this.#active) return;
       this.#emit("reconnecting", { delayMs: this.#retryDelay });
       this.#reconnectTimer = setTimeout(() => this.#connect(), this.#retryDelay);
-      this.#retryDelay = Math.min(this.#retryDelay * 2, 8_000);
+      this.#retryDelay = Math.min(Math.max(this.#retryDelay * 2, 500), 8_000);
     };
   }
 
