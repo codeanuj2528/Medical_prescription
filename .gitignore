@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets — real keys live in .env.local (never committed)
+.env
+.env.*
+!.env.example
+
+# Local tooling / editor
+.vercel
+.DS_Store
+.idea/
+.vscode/
+
+# Audio recordings and test clips
+*.wav

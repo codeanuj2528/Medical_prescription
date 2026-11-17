@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MediScribe — Live Medical Transcription</title>
+    <meta name="description" content="Live microphone transcription with voice activity detection, parallel Whisper speech-to-text and an AI clinical summary." />
+    <meta name="theme-color" content="#6366f1" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236366f1'/%3E%3Cpath d='M16 7a4 4 0 0 0-4 4v5a4 4 0 0 0 8 0v-5a4 4 0 0 0-4-4Zm-7 9a7 7 0 0 0 14 0M16 23v3' stroke='white' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />
+    <link rel="stylesheet" href="/css/app.css" />
+    <script type="module" src="/js/main.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <span class="brand-mark"><svg class="icon"><use href="/assets/icons.svg#stethoscope"></use></svg></span>
+          <div>
+            <p class="brand-name">MediScribe</p>
+            <p class="brand-tag">VAD-gated live clinical transcription</p>
+          </div>
+        </div>
+        <p class="engine-badge"><svg class="icon"><use href="/assets/icons.svg#audio-lines"></use></svg>Whisper large-v3 + turbo · Groq</p>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <!-- ── Left: live transcription ─────────────────────────────────── -->
+      <section class="card" aria-label="Live medical transcription">
+        <h2 class="card-title"><svg class="icon"><use href="/assets/icons.svg#mic"></use></svg>Live Medical Transcription</h2>
+
+        <div class="controls" role="toolbar" aria-label="Recording controls">
+          <button id="btn-start" class="btn btn-primary" type="button">
+            <svg class="icon"><use href="/assets/icons.svg#mic"></use></svg><span>Start Mic</span>
+          </button>
+          <button id="btn-stop" class="btn btn-danger" type="button" disabled>
+            <svg class="icon"><use href="/assets/icons.svg#square"></use></svg>Stop
+          </button>
+          <button id="btn-clear" class="btn btn-neutral" type="button" disabled>
+            <svg class="icon"><use href="/assets/icons.svg#trash-2"></use></svg>Clear
+          </button>
+          <button id="btn-save" class="btn btn-success" type="button" disabled>
+            <svg class="icon"><use href="/assets/icons.svg#download"></use></svg>Save Recording
+          </button>
+        </div>
+
+        <div class="stats">
+          <span class="pill"><svg class="icon"><use href="/assets/icons.svg#file-text"></use></svg>Words: <strong id="stat-words">0</strong></span>
+          <span class="pill"><svg class="icon"><use href="/assets/icons.svg#refresh-cw"></use></svg>Chunks: <strong id="stat-chunks">0</strong></span>
+          <span class="pill" title="Average time from your last spoken word to its text on screen (grey live text appears while you speak)">
+            <svg class="icon"><use href="/assets/icons.svg#gauge"></use></svg>Latency: <strong id="stat-latency">—</strong>
+          </span>
+          <span class="pill" title="Share of captured audio sent to the recogniser — the rest was silence/noise dropped by the VAD">
+            <svg class="icon"><use href="/assets/icons.svg#audio-lines"></use></svg>Sent: <strong id="stat-sent">—</strong>
+          </span>
+          <span class="pill"><svg class="icon"><use href="/assets/icons.svg#timer"></use></svg>Time: <strong id="stat-time">00:00</strong></span>
+          <label class="pill pill-select" title="Language spoken in the consultation. Auto detects it for every utterance (English, Hindi, Hinglish).">
+            <svg class="icon"><use href="/assets/icons.svg#languages"></use></svg>Language:
+            <select id="language" aria-label="Spoken language">
+              <option value="auto">Auto (EN / HI)</option>
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+            </select>
+          </label>
+        </div>
+
+        <p id="session-error" class="alert alert-error" role="alert" hidden></p>
+
+        <div class="wave-frame">
+          <div class="wave">
+            <canvas id="waveform" aria-hidden="true"></canvas>
+            <span id="vad-chip" class="vad-chip"><span class="dot"></span><span class="label">Mic off</span></span>
+            <div class="legend">
+              <span><i class="swatch" style="background: var(--brand)"></i>speech (sent)</span>
+              <span><i class="swatch" style="background: #cbd5e1"></i>noise (dropped)</span>
+              <span><i class="swatch line" style="background: #f59e0b"></i>VAD threshold</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="transcript" class="transcript scroll-thin" aria-label="Live transcript" aria-live="polite">
+          <p class="placeholder">
+            <svg class="icon"><use href="/assets/icons.svg#wand-sparkles"></use></svg>
+            <span id="placeholder-text">Ready — click Start Mic and speak naturally. VAD will auto-chunk your speech.</span>
+          </p>
+          <ol id="chunk-list" class="chunks"></ol>
+        </div>
+
+        <button id="btn-process" class="btn btn-block" type="button">
+          <svg class="icon"><use href="/assets/icons.svg#zap"></use></svg><span>Process Transcript with AI</span>
+        </button>
+      </section>
+
+      <!-- ── Right: AI summary ───────────────────────────────────────── -->
+      <section class="card summary-card" aria-label="AI medical summary">
+        <div class="summary-head">
+          <h2 class="card-title"><svg class="icon"><use href="/assets/icons.svg#hourglass"></use></svg>AI Medical Summary</h2>
+          <button id="btn-summary-clear" class="btn-square" type="button" disabled>
+            <svg class="icon"><use href="/assets/icons.svg#x"></use></svg>Clear
+          </button>
+        </div>
+
+        <div class="patient">
+          <p class="patient-name">Patient Name: <span id="patient-name">—</span></p>
+          <p class="patient-meta">Age: <span id="patient-age">—</span>&nbsp; Gender: <span id="patient-gender">—</span></p>
+          <p id="summary-meta" class="summary-meta" hidden></p>
+        </div>
+
+        <p id="summary-error" class="alert alert-error" role="alert" hidden></p>
+        <p id="summary-partial" class="alert alert-warn" role="status" hidden>
+          Part of the summary could not be generated — some sections may be empty.
+        </p>
+
+        <div id="summary-sections" class="summary-scroll scroll-thin">
+          <section class="sum-section">
+            <div class="sec-head"><svg class="icon"><use href="/assets/icons.svg#clipboard-list"></use></svg><h3>Clinical Summary</h3></div>
+            <textarea id="clinical-summary" class="summary-text" rows="4" readonly aria-label="Clinical summary"
+              placeholder="AI-generated clinical summary will appear here…"></textarea>
+          </section>
+          <!-- Remaining sections are rendered by js/ui/SummaryView.js from one config list. -->
+        </div>
+
+        <button id="btn-copy" class="btn btn-block" type="button" disabled>Copy to Prescription</button>
+      </section>
+    </main>
+
+    <footer class="footer">
+      AI-generated notes can be wrong — always review before clinical use. Audio is processed in memory and never stored on the server.
+    </footer>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+  </body>
+</html>

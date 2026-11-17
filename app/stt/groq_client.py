@@ -1,0 +1,113 @@
+"""Async client for Groq's OpenAI-compatible REST API.
+
+Only what this app needs, with the resilience that matters for latency:
+
+* one shared `httpx.AsyncClient` → TLS connections are kept alive and reused,
+* on HTTP 429 / 401 the request moves **immediately** to another key,
+* 5xx, timeouts and network errors are retried; 4xx client errors are not.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import httpx
+
+from .key_pool import KeyPool
+
+_RESET_PATTERN = re.compile(r"^(?:(\d+)m)?(?:([\d.]+)s)?$")
+
+
+class GroqError(Exception):
+    def __init__(self, status: int, message: str, retry_after_s: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # upstream HTTP status, 502 for network errors, 504 for timeouts
+        self.message = message
+        self.retry_after_s = retry_after_s
+
+    @classmethod
+    def from_response(cls, response: httpx.Response) -> GroqError:
+        try:
+            message = response.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = f"Groq returned HTTP {response.status_code}"
+        return cls(response.status_code, message, parse_retry_after(response.headers))
+
+
+def parse_retry_after(headers: httpx.Headers) -> float | None:
+    """Seconds to wait, from Retry-After or Groq's x-ratelimit-reset-requests ("2.5s", "1m3s")."""
+    try:
+        seconds = float(headers.get("retry-after", ""))
+        if seconds > 0:
+            return seconds
+    except ValueError:
+        pass
+    match = _RESET_PATTERN.match(headers.get("x-ratelimit-reset-requests", ""))
+    if not match or not any(match.groups()):
+        return None
+    return int(match.group(1) or 0) * 60 + float(match.group(2) or 0)
+
+
+class GroqClient:
+    def __init__(self, http: httpx.AsyncClient, keys: KeyPool, base_url: str, max_attempts: int | None = None) -> None:
+        self._http = http
+        self._keys = keys
+        self._base_url = base_url.rstrip("/")
+        self._max_attempts = max_attempts or min(3, len(keys) + 1)
+
+    async def transcribe(
+        self,
+        wav: bytes,
+        *,
+        model: str,
+        language: str | None,
+        prompt: str | None,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """POST /audio/transcriptions with verbose_json (we need per-segment confidence)."""
+        form: dict[str, str] = {"model": model, "response_format": "verbose_json", "temperature": "0"}
+        if language:
+            form["language"] = language
+        if prompt:
+            form["prompt"] = prompt
+        return await self._post(
+            "/audio/transcriptions",
+            timeout_s,
+            data=form,
+            files={"file": ("segment.wav", wav, "audio/wav")},
+        )
+
+    async def chat_completion(self, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
+        return await self._post("/chat/completions", timeout_s, json=payload)
+
+    async def _post(self, path: str, timeout_s: float, **request: Any) -> dict[str, Any]:
+        last_error = GroqError(502, "Groq request failed")
+        for _ in range(self._max_attempts):
+            key = self._keys.acquire()
+            try:
+                response = await self._http.post(
+                    f"{self._base_url}{path}",
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=timeout_s,
+                    **request,
+                )
+            except httpx.TimeoutException:
+                last_error = GroqError(504, "The AI service timed out")
+                continue
+            except httpx.TransportError:
+                last_error = GroqError(502, "Could not reach the AI service")
+                continue
+
+            if response.is_success:
+                return response.json()
+
+            error = GroqError.from_response(response)
+            if response.status_code == 429:
+                self._keys.mark_rate_limited(key, error.retry_after_s or 2.0)
+            elif response.status_code in (401, 403):
+                self._keys.mark_invalid(key)
+            elif response.status_code < 500:
+                raise error  # bad input: another attempt will not help
+            last_error = error
+        raise last_error
