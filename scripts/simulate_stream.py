@@ -81,21 +81,22 @@ async def receive(ws: websockets.ClientConnection, report: Report) -> None:
             return
 
 
-async def stream(path: Path, url: str, speed: float, language: str) -> Report:
+async def stream(path: Path, url: str, speed: float, language: str, chunk_ms: int = CHUNK_MS) -> Report:
     pcm, rate = decode_wav(path.read_bytes())
     pcm = resample(pcm, rate, SAMPLE_RATE)
-    step = SAMPLE_RATE * CHUNK_MS // 1000
+    step = SAMPLE_RATE * chunk_ms // 1000
     report = Report()
     print(f"Streaming {path.name} ({len(pcm) / SAMPLE_RATE:.1f} s) to {url} at {speed}× real time\n")
 
-    async with websockets.connect(url, max_size=2**22) as ws:
+    # ping_interval=None: browsers never send WebSocket pings, so neither does this script.
+    async with websockets.connect(url, max_size=2**22, ping_interval=None) as ws:
         await ws.send(json.dumps({"type": "start", "language": language}))
         receiver = asyncio.create_task(receive(ws, report))
         began = time.perf_counter()
         for index, start in enumerate(range(0, len(pcm), step)):
             await ws.send(pcm[start : start + step].tobytes())
             # Pace against the clock (not sleep-by-sleep) so the stream never drifts behind real time.
-            due = began + (index + 1) * CHUNK_MS / 1000 / speed
+            due = began + (index + 1) * chunk_ms / 1000 / speed
             await asyncio.sleep(max(0.0, due - time.perf_counter()))
         await ws.send(json.dumps({"type": "stop"}))
         await asyncio.wait_for(receiver, timeout=60)
@@ -131,10 +132,11 @@ def main() -> None:
     parser.add_argument("--url", default="ws://localhost:8000/ws/transcribe")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed (1 = real time)")
     parser.add_argument("--language", choices=["auto", "en", "hi"], default="auto", help="spoken language")
+    parser.add_argument("--chunk-ms", type=int, default=CHUNK_MS, help="audio per WebSocket message (ms)")
     parser.add_argument("--summarize", action="store_true", help="also request the AI summary")
     args = parser.parse_args()
 
-    report = asyncio.run(stream(args.wav, args.url, args.speed, args.language))
+    report = asyncio.run(stream(args.wav, args.url, args.speed, args.language, args.chunk_ms))
     transcript = " ".join(report.texts[i] for i in sorted(report.texts) if report.texts[i])
     print(f"\n── Transcript ─────────────────────────────────────────\n{transcript}")
     if args.summarize:

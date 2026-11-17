@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .budget import RequestBudgets
-from .groq_client import GroqClient
+from .groq_client import GroqClient, GroqError
 from .hallucination import HallucinationFilter
 from .language import LanguagePolicy, language_code
 
@@ -75,21 +75,47 @@ class TranscriptionService:
         `optional=True` (early passes, or a final whose text is already on
         screen) raises BudgetExhausted instead of eating into the quota reserved
         for final text, and fails fast instead of waiting out a rate limit.
+
+        A required final never waits for the accurate model's quota: if it is
+        used up (by our count, or Groq answers 429) the fast model writes the
+        final instead — the two models have separate per-minute limits.
         """
         started = time.perf_counter()
-        self._spend(self._model, optional=optional)
-        if language is None:
-            raw, language, prompt = await self._transcribe_auto(wav, optional)
-        else:
-            prompt = prompt_for(language, context)
-            raw = await self._request(wav, language, prompt, may_wait=not optional)
+        model = self._fast_model if not optional and self._accurate_exhausted() else self._model
+        self._spend(model, optional=optional)
+        can_fall_back = not optional and model != self._fast_model
+        try:
+            raw, detected, prompt = await self._decode(
+                wav, context, language, model, optional, may_wait=not optional and not can_fall_back
+            )
+        except GroqError as error:
+            if not can_fall_back or error.status != 429:
+                raise
+            logger.info("%s is rate-limited: final text from %s", self._model, self._fast_model)
+            self._spend(self._fast_model, optional=False)
+            raw, detected, prompt = await self._decode(wav, context, language, self._fast_model, False, may_wait=True)
 
         return TranscriptionResult(
             text=self._filter.clean(raw, prompt=prompt),
-            language=language or language_code(raw.get("language")),
+            language=detected or language_code(raw.get("language")),
             audio_ms=round(float(raw.get("duration") or 0) * 1000),
             upstream_ms=round((time.perf_counter() - started) * 1000),
         )
+
+    def _accurate_exhausted(self) -> bool:
+        """By our count the accurate model has no request left this minute."""
+        if self._budgets is None or self._fast_model == self._model:
+            return False
+        return self._budgets.for_model(self._model).available < 1
+
+    async def _decode(
+        self, wav: bytes, context: str, language: str | None, model: str, optional: bool, *, may_wait: bool
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        """One transcription with `model`: auto-detect (speculative) or a fixed language."""
+        if language is None:
+            return await self._transcribe_auto(wav, model, optional, may_wait)
+        prompt = prompt_for(language, context)
+        return await self._request(wav, language, prompt, model=model, may_wait=may_wait), language, prompt
 
     async def preview(self, wav: bytes, language: str | None = None, *, at_pause: bool = False) -> TranscriptionResult:
         """Quick single-pass transcription with the fast model, for text shown on screen at once.
@@ -117,7 +143,9 @@ class TranscriptionService:
             upstream_ms=round((time.perf_counter() - started) * 1000),
         )
 
-    async def _transcribe_auto(self, wav: bytes, optional: bool) -> tuple[dict[str, Any], str | None, str | None]:
+    async def _transcribe_auto(
+        self, wav: bytes, model: str, optional: bool, may_wait: bool
+    ) -> tuple[dict[str, Any], str | None, str | None]:
         """Speculative parallel decoding for auto-detect.
 
         Whisper writes English most faithfully with *no* prompt, and Hinglish
@@ -130,10 +158,10 @@ class TranscriptionService:
         The speculative pass is optional: when the request budget is short it is
         skipped and Hindi keeps the plain pass's (Devanagari-only) text.
         """
-        plain = asyncio.ensure_future(self._request(wav, None, None, may_wait=not optional))
+        plain = asyncio.ensure_future(self._request(wav, None, None, model=model, may_wait=may_wait))
         hindi = None
-        if self._policy.expects("hi") and self._try_spend(self._model):
-            hindi = asyncio.ensure_future(self._request(wav, "hi", CODE_MIXED_STYLE, may_wait=False))
+        if self._policy.expects("hi") and self._try_spend(model):
+            hindi = asyncio.ensure_future(self._request(wav, "hi", CODE_MIXED_STYLE, model=model, may_wait=False))
         try:
             raw = await plain
         except BaseException:
@@ -153,9 +181,9 @@ class TranscriptionService:
             return raw, target, None
         # Implausible detection (e.g. "Welsh" for a one-word English reply): redo it in the expected language.
         logger.info("Detected %r — re-transcribing as %r", raw.get("language"), target)
-        self._spend(self._model, optional=optional)
+        self._spend(model, optional=optional)
         prompt = prompt_for(target, "")
-        return await self._request(wav, target, prompt, may_wait=not optional), target, prompt
+        return await self._request(wav, target, prompt, model=model, may_wait=may_wait), target, prompt
 
     def _spend(self, model: str, *, optional: bool, keep: float | None = None) -> None:
         if self._budgets is None:

@@ -105,3 +105,42 @@ async def test_client_reports_429s_to_the_budget():
     client = GroqClient(http, KeyPool(["k"]), "https://groq.test", budgets=budgets)
     await client.transcribe(b"wav", model="whisper-large-v3", language=None, prompt=None, timeout_s=5)
     assert budgets.for_model("whisper-large-v3").available < 1
+
+
+class RateLimitedAccurateModel:
+    """Groq fake where the accurate model is out of quota and the fast one is fine."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def transcribe(self, wav, **kwargs):
+        from app.stt.groq_client import GroqError
+
+        self.calls.append(kwargs)
+        if kwargs["model"] == "whisper-large-v3":
+            raise GroqError(429, "Rate limit reached", 3.0)
+        return whisper("Your throat looks red.", "English")
+
+
+async def test_rate_limited_final_falls_back_to_the_fast_model_without_waiting():
+    groq = RateLimitedAccurateModel()
+    result = await limited_service(groq, per_minute=20).transcribe(b"wav", language="en")
+    assert result.text == "Your throat looks red."
+    assert [call["model"] for call in groq.calls] == ["whisper-large-v3", "whisper-large-v3-turbo"]
+    assert groq.calls[0]["may_wait"] is False  # don't sit out a 3 s rate limit when another model is free
+
+
+async def test_final_goes_straight_to_the_fast_model_when_accurate_quota_is_spent():
+    groq = RateLimitedAccurateModel()
+    service = limited_service(groq, per_minute=20)
+    service._budgets.rate_limited("whisper-large-v3")  # bucket drained by an earlier 429
+    await service.transcribe(b"wav", language="en")
+    assert [call["model"] for call in groq.calls] == ["whisper-large-v3-turbo"]
+
+
+async def test_optional_passes_do_not_fall_back():
+    from app.stt.groq_client import GroqError
+
+    groq = RateLimitedAccurateModel()
+    with pytest.raises(GroqError):
+        await limited_service(groq, per_minute=20).transcribe(b"wav", language="en", optional=True)
