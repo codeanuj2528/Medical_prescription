@@ -153,7 +153,7 @@ def test_websocket_answers_heartbeat_pings(client):
 
 
 def test_pings_are_answered_while_stop_waits_for_the_last_transcriptions(client):
-    # The browser treats a server that stays silent for 5 s as a dead connection,
+    # The browser treats a server that stays silent for 3 s as a dead connection,
     # so a slow final transcription must not hold up the heartbeat.
     client.transcription.delay_s = 0.5
     data = to_pcm16(consultation()).tobytes()

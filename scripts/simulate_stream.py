@@ -5,7 +5,7 @@ server event, then reports how much audio the VAD filtered out and the
 latency. Like the browser, it survives dropped connections: it reconnects at
 once and replays the audio whose transcription never came back, so a drop
 costs a moment of delay, not words — and, like the browser, it pings every
-2 s and treats a server that has said nothing for 5 s as a dropped
+second and treats a server that has said nothing for 3 s as a dropped
 connection. Optionally asks for the AI summary.
 
     uv run python scripts/simulate_stream.py consultation.wav
@@ -38,8 +38,8 @@ SAMPLES_PER_MS = SAMPLE_RATE // 1000
 CHUNK_MS = 100  # same as the browser
 MAX_REPLAY_MS = 30_000  # same as the browser
 MAX_RECONNECTS = 10
-HEARTBEAT_S = 2.0  # same as the browser
-SILENT_SERVER_S = 5.0
+HEARTBEAT_S = 1.0  # same as the browser
+SILENT_SERVER_S = 3.0
 
 
 class Dropped(Exception):
@@ -158,7 +158,7 @@ class LiveStream:
         return from_ms
 
     async def watch(self, ws: websockets.ClientConnection) -> None:
-        """Receive until "stopped"; meanwhile ping every 2 s and give up on a silent server."""
+        """Receive until "stopped"; meanwhile ping every second and give up on a silent server."""
         self.last_heard = time.perf_counter()
         receiving = asyncio.ensure_future(self.receive(ws))
         try:

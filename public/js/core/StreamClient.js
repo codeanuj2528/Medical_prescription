@@ -9,14 +9,14 @@
  *   replays the audio the old connection never finished transcribing — so a
  *   drop costs a moment of delay, not lost words.
  * - A connection can also die *silently* (still "open", but nothing gets
- *   through). A heartbeat catches that: a "ping" every 2 s, and if the server
- *   has said nothing at all for 5 s the connection is treated as dropped.
+ *   through). A heartbeat catches that: a "ping" every second, and if the server
+ *   has said nothing at all for 3 s the connection is treated as dropped.
  * - Server messages are re-emitted as DOM events named after their "type".
  */
 const MAX_QUEUED_BYTES = 10 * 32_000; // 10 s of 16 kHz PCM16
 const STOP_TIMEOUT_MS = 20_000;
-const HEARTBEAT_MS = 2_000;
-const SILENT_SERVER_MS = 5_000; // the server normally talks ~10×/s (VAD telemetry), and answers every ping
+const HEARTBEAT_MS = 1_000;
+const SILENT_SERVER_MS = 3_000; // the server normally talks ~10×/s (VAD telemetry), and answers every ping
 
 export class StreamClient extends EventTarget {
   #url;
@@ -142,7 +142,7 @@ export class StreamClient extends EventTarget {
     };
   }
 
-  /** Every 2 s: ping, and give up on a connection the server has gone silent on. */
+  /** Every second: ping, and give up on a connection the server has gone silent on. */
   #checkHeartbeat() {
     const ws = this.#ws;
     if (ws?.readyState !== WebSocket.OPEN) return;
