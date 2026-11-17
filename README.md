@@ -12,7 +12,7 @@ summary.
 Browser (thin client)                     Python / FastAPI (all the logic)                         Groq
 ─────────────────────                     ────────────────────────────────                         ────
 mic ─▶ AudioWorklet ─▶ 16 kHz PCM16 ──WS──▶ 20 ms frames ─▶ EnergyVad ─▶ SpeechSegmenter ─▶ utterance
-       (resample, 60 ms chunks)            │                  │              │                 │
+       (resample, 100 ms chunks)           │                  │              │                 │
                                            │      VAD telemetry (waveform)   │ silence/noise   ▼
 UI ◀───── live text + final text ◀────────┴──────────────────────────────── │ dropped here   WAV ─▶ Whisper turbo + large-v3
                                                                              │                (parallel, key pool)
@@ -34,13 +34,22 @@ pauses), streamed in real time over the WebSocket with
 | Grey live text while still speaking | updates every ≈ 0.7 s | same |
 | AI summary (2 parallel extractors) | ≈ 1.1–1.4 s | ≈ 1.2–1.5 s |
 
+**On production** (Vercel, Mumbai region, 8 free Groq keys, streamed from India
+with the same script, which reconnects exactly like the browser):
+
+| Run | Utterances | Dropped connections | Last word → text on screen |
+|---|---|---|---|
+| English, 71 s | 13 / 13 | 1, recovered | avg 352 ms · p95 491 ms |
+| Hinglish, 39 s (at the same time) | 7 / 7 | 0 | avg 297 ms · p95 493 ms |
+| One continuous 6-minute consultation | 65 / 65, none failed, none duplicated | 4, all recovered | avg 313 ms · p95 529 ms |
+
 Example Hinglish output: *"हाँ, मुझे sugar है। मैं metformin 500 लेता हूँ। और
 penicillin से allergy है।"* — the summary then lists Metformin 500 mg (current
 medication, frequency left blank because it wasn't said) and a penicillin allergy.
 
 About 60 ms of that is noticing the pause and ~240 ms is Groq's own Whisper
 time — the practical floor for a non-streaming model. With a single free key
-the request budget (below) trims live work so nothing ever fails. 112 tests pass
+the request budget (below) trims live work so nothing ever fails. 117 tests pass
 (`pytest`), `ruff` clean.
 
 ## How the VAD works
@@ -227,7 +236,7 @@ needs `localhost` or HTTPS.)
 ## Test
 
 ```bash
-uv run pytest                    # 112 tests, ~2 s, no network needed
+uv run pytest                    # 117 tests, ~3 s, no network needed
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -238,9 +247,11 @@ uv run python scripts/simulate_stream.py consultation.wav --summarize
 uv run python scripts/simulate_stream.py hinglish.wav --language auto
 ```
 
-It streams the file in real time exactly like the browser does and prints the
-live text and final text of every utterance, the % of audio the VAD filtered
-out, last-word → final-text latency (avg/p50/p95), the transcript and the AI summary.
+It streams the file in real time exactly like the browser does — including
+the heartbeat, reconnecting and replaying after a dropped connection — and
+prints the live text and final text of every utterance, the % of audio the VAD
+filtered out, dropped connections, last-word → final-text latency
+(avg/p50/p95), the transcript and the AI summary.
 
 ## Deploy to Vercel
 
@@ -260,14 +271,41 @@ adds security headers. `uvicorn[standard]` is a runtime dependency on purpose:
 Vercel's Python runtime needs a WebSocket implementation installed.
 
 **Dropped connections are expected on Vercel and handled.** A WebSocket ends at
-the function's max duration (300 s on Hobby), and in testing Vercel's proxy also
-dropped Python WebSocket connections without a close frame (more often at 50
-messages/s than at 10 — hence 100 ms audio messages), with no error in the
-function logs. The browser reconnects immediately, starts a fresh session with
-the same chunk numbering and transcript context, and **replays the audio the old
-connection never finished** (from the start of the first unfinished utterance,
-held in the in-memory recording). Verified by restarting the server mid-stream:
-every utterance transcribed once, in order, nothing lost.
+the function's max duration (300 s on Hobby), and Python WebSockets on Vercel
+are also cut at random. Measured on production, with the app's own connection
+logs:
+
+* a connection streaming only background noise (no Groq calls at all) died
+  after 67 s — the same second as another connection on the same instance;
+  others lasted 27 s, 52 s, 110 s;
+* it is not the amount of data (2.5 MB sent at 8× speed, 6.2 MB at 2×) and
+  not WebSocket pings (every server ping got its pong);
+* it has two shapes: the TCP connection is reset (no close frame), or it goes
+  **silent** — still "open" at both ends, nothing gets through. The server log
+  still lists such a connection as open after the browser has reconnected.
+
+The browser (and `scripts/simulate_stream.py`) handles both:
+
+1. **Reconnect + replay.** It reconnects at once, starts a fresh session with
+   the same chunk numbering and transcript context, and **replays the audio the
+   old connection never finished** (from the start of the first unfinished
+   utterance, kept in the in-memory recording). Whatever the replay covers is
+   transcribed again once — no gaps, no duplicates. A fresh VAD starting in the
+   middle of speech finds the utterance within 0–100 ms.
+2. **Heartbeat.** A `ping` every second; the server answers at once (and sends
+   VAD telemetry ~10× a second anyway). A server silent for 3 s means a dead
+   connection → step 1. Without it, a silent connection swallowed speech until
+   the server's own ping timeout, up to ~40 s later.
+3. **Stop survives a drop.** If the connection dies while the server is
+   finishing the last sentence, the browser reconnects, replays and sends
+   `stop` again, so the last sentence is not lost.
+
+Each connection logs `WebSocket opened …` / `closed after N s with code C on
+instance I`, so drops show up in the Vercel logs. Verified in a real browser
+against a local server, by restarting the server mid-stream and by a proxy
+that silences the connection (also during Stop): every utterance transcribed
+once, in order. If zero drops matter more than serverless, the same app runs
+unchanged on any long-running host (`uvicorn app.main:app`).
 
 ## API
 
@@ -277,11 +315,13 @@ every utterance transcribed once, in order, nothing lost.
 {"type": "start", "chunkOffset": 0, "context": "", "language": "auto"}
 {"type": "stop"}
 {"type": "retry", "id": 7}
+{"type": "ping"}
 ```
 
 Server sends `ready`, `vad` (per-frame `[energyDb, thresholdDb, isSpeech,
 inUtterance]`), `chunk` (`pending` when speech starts → `partial` live text →
-`done` with `text`, `language`, `latencyMs` — or `failed`), `stopped`, `error`.
+`done` with `text`, `language`, `latencyMs` — or `failed`), `stopped`, `pong`,
+`error`.
 
 **`POST /api/summarize`** `{"transcript": "..."}` →
 `{"summary": {...}, "model": "...", "latency_ms": 1241, "partial": false}`
